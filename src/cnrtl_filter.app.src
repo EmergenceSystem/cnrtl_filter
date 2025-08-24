@@ -1,0 +1,18 @@
+{application, cnrtl_filter, [
+    {description, "em_filter example for Centre National de Ressources Textuelles et Lexicales (CNRTL)"},
+    {vsn, "0.1.0"},
+    {registered, []},
+    {mod, {cnrtl_filter_app, []}},
+    {applications, [
+        kernel,
+        stdlib,
+        jsone,
+        cowboy,
+	ssl,
+        em_filter
+    ]},
+    {env, []},
+    {modules, []},
+    {licenses, ["Apache-2.0"]},
+    {links, [{"GitHub", "https://github.com/EmergenceSystem/cnrtl_filter"}]}
+]}.
