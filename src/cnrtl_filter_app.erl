@@ -148,7 +148,7 @@ clean_definition_block(Block) ->
     %% Remove HTML tags
     NoTags = re:replace(Block, "<[^>]+>", " ", [global, {return, list}]),
     %% Decode HTML entities
-    Decoded = decode_html_entities(NoTags),
+    Decoded = embryo:decode_html_entities(NoTags),
     %% Clean multiple spaces
     CleanSpaces = re:replace(Decoded, "\\s+", " ", [global, {return, list}]),
     %% Trim whitespace
@@ -197,23 +197,6 @@ is_numeric_or_symbol(Str) ->
         C =:= $/ orelse C =:= $' orelse C =:= $- orelse
         C =:= $  %% space
     end, Str).
-
-%%------------------------------------------------------------------
-%% HTML Entity Decoding
-%%------------------------------------------------------------------
-
-decode_html_entities(Text) ->
-    Entities = [
-        {"&amp;", "&"}, {"&lt;", "<"}, {"&gt;", ">"},
-        {"&quot;", "\""}, {"&#39;", "'"},
-        {"&agrave;", "à"}, {"&aacute;", "á"},
-        {"&eacute;", "é"}, {"&egrave;", "è"}, {"&ecirc;", "ê"},
-        {"&icirc;", "î"}, {"&ocirc;", "ô"}, {"&ugrave;", "ù"},
-        {"&ccedil;", "ç"}, {"&nbsp;", " "}
-    ],
-    lists:foldl(fun({Entity, Char}, Acc) ->
-        re:replace(Acc, Entity, Char, [global, {return, list}])
-    end, Text, Entities).
 
 %%------------------------------------------------------------------
 %% Embryo Construction
