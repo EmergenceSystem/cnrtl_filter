@@ -3,7 +3,7 @@
 
 %% API Exports
 -export([start/2, stop/1]).
--export([init/2, terminate/3]).
+-export([handle/1]).
 
 %% Constants
 -define(BASE_URL, "https://www.cnrtl.fr/definition/").
@@ -27,24 +27,21 @@ stop(_State) ->
 %% HTTP Handler
 %%------------------------------------------------------------------
 
-init(Req0, State) ->
-    {ok, Body, Req} = cowboy_req:read_body(Req0),
-    io:format("[INFO] Received body: ~p~n", [Body]),
+%% @doc Handle incoming requests from the filter server.
+%% This function is called by em_filter_server through Wade.
+%% @param Body The request body (JSON binary or string)
+%% @return JSON response as binary or string
+handle(Body) when is_binary(Body) ->
+    handle(binary_to_list(Body));
 
-    EmbryoList = generate_embryo_list(Body),
+handle(Body) when is_list(Body) ->
+    io:format("Bing Filter received body: ~p~n", [Body]),
+    EmbryoList = generate_embryo_list(list_to_binary(Body)),
     Response = #{embryo_list => EmbryoList},
-    EncodedResponse = jsone:encode(Response),
+    jsone:encode(Response);
 
-    Req2 = cowboy_req:reply(
-        200,
-        #{<<"content-type">> => <<"application/json">>},
-        EncodedResponse,
-        Req
-    ),
-    {ok, Req2, State}.
-
-terminate(_Reason, _Req, _State) ->
-    ok.
+handle(_) ->
+    jsone:encode(#{error => <<"Invalid request body">>}).
 
 %%------------------------------------------------------------------
 %% Main Definition Extraction
