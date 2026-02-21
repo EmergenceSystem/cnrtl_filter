@@ -6,8 +6,6 @@
     {applications, [
         kernel,
         stdlib,
-        jsone,
-	    ssl,
         em_filter
     ]},
     {env, []},

@@ -1,216 +1,150 @@
+%%%-------------------------------------------------------------------
+%%% @doc CNRTL French dictionary filter.
+%%%
+%%% Fetches definitions from the CNRTL website for a given word
+%%% and returns them as a list of embryo maps.
+%%% @end
+%%%-------------------------------------------------------------------
 -module(cnrtl_filter_app).
 -behaviour(application).
 
-%% API Exports
 -export([start/2, stop/1]).
 -export([handle/1]).
 
-%% Constants
--define(BASE_URL, "https://www.cnrtl.fr/definition/").
--define(MIN_DEF_LENGTH, 10).       %% Minimum length for a valid definition
--define(MAX_DEF_LENGTH, 1000).     %% Maximum length for a valid definition
--define(MIN_WORD_COUNT, 3).         %% Minimum number of words in a definition
--define(MAX_WORD_COUNT, 50).        %% Maximum number of words in a definition
+-define(BASE_URL,       "https://www.cnrtl.fr/definition/").
+-define(MIN_DEF_LENGTH, 10).
+-define(MAX_DEF_LENGTH, 1000).
+-define(MIN_WORD_COUNT, 3).
+-define(MAX_WORD_COUNT, 50).
 
-%%------------------------------------------------------------------
-%% Application Lifecycle
-%%------------------------------------------------------------------
+%%====================================================================
+%% Application behaviour
+%%====================================================================
 
 start(_Type, _Args) ->
-    {ok, Port} = em_filter:find_port(),
-    em_filter_sup:start_link(cnrtl_filter, ?MODULE, Port).
+    em_filter:start_filter(cnrtl_filter, ?MODULE).
 
 stop(_State) ->
-    ok.
+    em_filter:stop_filter(cnrtl_filter).
 
-%%------------------------------------------------------------------
-%% HTTP Handler
-%%------------------------------------------------------------------
+%%====================================================================
+%% Filter handler — returns a list of embryo maps
+%%====================================================================
 
-%% @doc Handle incoming requests from the filter server.
-%% This function is called by em_filter_server through Wade.
-%% @param Body The request body (JSON binary or string)
-%% @return JSON response as binary or string
 handle(Body) when is_binary(Body) ->
-    handle(binary_to_list(Body));
-
-handle(Body) when is_list(Body) ->
-    io:format("Bing Filter received body: ~p~n", [Body]),
-    EmbryoList = generate_embryo_list(list_to_binary(Body)),
-    Response = #{embryo_list => EmbryoList},
-    jsone:encode(Response);
-
+    generate_embryo_list(Body);
 handle(_) ->
-    jsone:encode(#{error => <<"Invalid request body">>}).
+    [].
 
-%%------------------------------------------------------------------
-%% Main Definition Extraction
-%%------------------------------------------------------------------
+%%====================================================================
+%% Search and processing
+%%====================================================================
 
 generate_embryo_list(JsonBinary) ->
-    Search = case jsone:decode(JsonBinary, [{keys, atom}]) of
-        SearchMap when is_map(SearchMap) ->
-            Value = binary_to_list(maps:get(value, SearchMap, <<"">>)),
-            Timeout = list_to_integer(binary_to_list(maps:get(timeout, SearchMap, <<"10">>))),
+    {Value, _Timeout} = extract_params(JsonBinary),
+    case Value of
+        "" -> [];
+        _  ->
+            Url = ?BASE_URL ++ Value,
+            case httpc:request(get, {Url, []}, [], [{body_format, binary}]) of
+                {ok, {{_, 200, _}, _, Html}} ->
+                    extract_all_definitions(Html, Value);
+                _ ->
+                    []
+            end
+    end.
+
+extract_params(JsonBinary) ->
+    try json:decode(JsonBinary) of
+        Map when is_map(Map) ->
+            Value   = binary_to_list(maps:get(<<"value">>,   Map, <<"">>)),
+            Timeout = case maps:get(<<"timeout">>, Map, undefined) of
+                undefined            -> 10;
+                T when is_integer(T) -> T;
+                T when is_binary(T)  -> binary_to_integer(T)
+            end,
             {Value, Timeout};
         _ ->
-            {"", 10}
-    end,
-
-    {SearchValue, _Timeout} = Search,
-    io:format("[INFO] Search word: ~p~n", [SearchValue]),
-
-    if
-        SearchValue =/= "" ->
-            Url = ?BASE_URL ++ SearchValue,
-            io:format("[INFO] CNRTL URL: ~s~n", [Url]),
-
-            case httpc:request(get, {Url, []}, [], [{body_format, binary}]) of
-                {ok, {{_, 200, _}, _, Body}} ->
-                    extract_all_definitions(Body, SearchValue);
-                {error, Reason} ->
-                    io:format("[ERROR] HTTP Error: ~p~n", [Reason]),
-                    []
-            end;
-        true ->
-            io:format("[ERROR] Empty 'value' field~n"),
-            []
+            {binary_to_list(JsonBinary), 10}
+    catch
+        _:_ -> {binary_to_list(JsonBinary), 10}
     end.
 
-%%------------------------------------------------------------------
-%% Definition Extraction with Safe Filtering
-%%------------------------------------------------------------------
+%%--------------------------------------------------------------------
+%% Definition extraction
+%%--------------------------------------------------------------------
 
 extract_all_definitions(HtmlBin, Word) ->
-    Html = binary_to_list(HtmlBin),
-    io:format("[DEBUG] Parsing HTML (~p characters)...~n", [length(Html)]),
-
-    %% Extract definition blocks
-    DefBlocks = extract_definition_blocks(Html),
-
-    %% Clean and validate each block
-    CleanedDefs = [clean_definition_block(Block) || Block <- DefBlocks, Block =/= ""],
-    io:format("[DEBUG] Found ~p raw definitions~n", [length(CleanedDefs)]),
-
-    %% Filter valid definitions
-    ValidDefs = [Def || Def <- CleanedDefs, is_valid_definition(Def)],
-    io:format("[DEBUG] ~p definitions passed basic validation~n", [length(ValidDefs)]),
-
-    %% Apply edge case filtering
-    try
-        FinalDefs = filter_edge_cases(ValidDefs),
-        build_embryos(Word, FinalDefs, 1, [])
-    catch
-        error:Reason ->
-            io:format("[ERROR] Error in edge case filtering: ~p~n", [Reason]),
-            build_embryos(Word, ValidDefs, 1, [])
-    end.
-
-%%------------------------------------------------------------------
-%% Definition Block Extraction
-%%------------------------------------------------------------------
+    Html     = binary_to_list(HtmlBin),
+    Blocks   = extract_definition_blocks(Html),
+    Cleaned  = [clean_definition_block(B) || B <- Blocks, B =/= ""],
+    Valid    = [D || D <- Cleaned, is_valid_definition(D)],
+    Final    = filter_edge_cases(Valid),
+    build_embryos(Word, Final, 1, []).
 
 extract_definition_blocks(Html) ->
     Patterns = [
-        %% Primary patterns for definition blocks
         "<div[^>]*class=\"tlf_cdefinition\"[^>]*>(.*?)</div>",
         "<span[^>]*class=\"tlf_cdefinition\"[^>]*>(.*?)</span>",
         "<p[^>]*class=\"tlf_cdefinition\"[^>]*>(.*?)</p>",
         "<div[^>]*id=\"def\\d+\"[^>]*>(.*?)</div>",
         "<[^>]*class=\"[^\"]*definition[^\"]*\"[^>]*>(.*?)</[^>]+>"
     ],
+    try_patterns(Html, Patterns).
 
-    try_extract_blocks(Html, Patterns, 1).
-
-try_extract_blocks(_Html, [], _Index) ->
-    io:format("[DEBUG] No definition blocks found with standard patterns~n"),
-    [];
-
-try_extract_blocks(Html, [Pattern|Rest], Index) ->
-    io:format("[DEBUG] Trying pattern ~p: ~s~n", [Index, Pattern]),
-    case re:run(Html, Pattern, [global, {capture, [1], list}]) of
+try_patterns(_Html, []) -> [];
+try_patterns(Html, [Pat | Rest]) ->
+    case re:run(Html, Pat, [global, dotall, {capture, [1], list}]) of
         {match, Matches} ->
-            Filtered = [M || [M] <- Matches, M =/= ""],
-            io:format("[DEBUG] Pattern ~p succeeded (~p blocks found)~n", [Index, length(Filtered)]),
-            Filtered;
+            [M || [M] <- Matches, M =/= ""];
         nomatch ->
-            try_extract_blocks(Html, Rest, Index + 1)
+            try_patterns(Html, Rest)
     end.
 
-%%------------------------------------------------------------------
-%% Definition Cleaning and Validation
-%%------------------------------------------------------------------
-
 clean_definition_block(Block) ->
-    %% Remove HTML tags
-    NoTags = re:replace(Block, "<[^>]+>", " ", [global, {return, list}]),
-    %% Decode HTML entities
-    Decoded = embryo:decode_html_entities(NoTags),
-    %% Clean multiple spaces
-    CleanSpaces = re:replace(Decoded, "\\s+", " ", [global, {return, list}]),
-    %% Trim whitespace
-    string:trim(CleanSpaces).
+    NoTags   = re:replace(Block, "<[^>]+>", " ", [global, {return, list}]),
+    Decoded  = embryo:decode_html_entities(NoTags),
+    Clean    = re:replace(Decoded, "\\s+", " ", [global, {return, list}]),
+    string:trim(Clean).
 
 is_valid_definition(Def) ->
-    %% Check length constraints
-    LengthOk = length(Def) >= ?MIN_DEF_LENGTH andalso length(Def) =< ?MAX_DEF_LENGTH,
-
-    %% Check it starts with uppercase
-    StartsWithUpper = case Def of
-        [] -> false;
-        [First|_] -> First =:= string:to_upper(First)
+    Len      = length(Def),
+    Words    = string:tokens(Def, " "),
+    WCount   = length(Words),
+    LenOk    = Len >= ?MIN_DEF_LENGTH andalso Len =< ?MAX_DEF_LENGTH,
+    UpperOk  = case Def of
+        []        -> false;
+        [H | _]   -> H =:= string:to_upper(H)
     end,
+    PunctOk  = lists:member(string:right(Def, 1), [".", ";", "!", "?"]),
+    WCountOk = WCount >= ?MIN_WORD_COUNT andalso WCount =< ?MAX_WORD_COUNT,
+    LenOk andalso UpperOk andalso PunctOk andalso WCountOk.
 
-    %% Check it ends with punctuation
-    EndsWithPunct = lists:member(string:right(Def, 1), [".", ";", "!", "?"]),
-
-    %% Check word count
-    Words = string:tokens(Def, " "),
-    WordCountOk = length(Words) >= ?MIN_WORD_COUNT andalso length(Words) =< ?MAX_WORD_COUNT,
-
-    %% All conditions must be met
-    LengthOk andalso StartsWithUpper andalso EndsWithPunct andalso WordCountOk.
-
-%% @doc Filter out edge cases and invalid definitions (corrected version)
 filter_edge_cases(Defs) ->
-    [Def || Def <- Defs,
-     %% Remove single-word definitions (like "Raton laveur")
-     length(string:tokens(Def, " ")) > 1,
-     %% Remove definitions that look like they contain HTML fragments
-     not string:str(Def, "<"),
-     %% Remove definitions that are just numbers or symbols
-     not is_numeric_or_symbol(Def),
-     %% Remove definitions that are too similar to others
-     not lists:any(fun(Other) -> string:str(Def, Other) andalso Def =/= Other end, lists:delete(Def, Defs))
-    ].
+    [D || D <- Defs,
+          length(string:tokens(D, " ")) > 1,
+          string:str(D, "<") =:= 0,
+          not is_numeric_or_symbol(D),
+          not lists:any(fun(O) -> string:str(D, O) > 0 andalso D =/= O end,
+                        lists:delete(D, Defs))].
 
-%% @doc Check if a string is numeric or just symbols
 is_numeric_or_symbol(Str) ->
-    %% Check if string contains only numbers, spaces, or punctuation
     lists:all(fun(C) ->
         (C >= $0 andalso C =< $9) orelse
-        C =:= $. orelse C =:= $, orelse C =:= $; orelse
-        C =:= $! orelse C =:= $? orelse C =:= $: orelse
-        C =:= $/ orelse C =:= $' orelse C =:= $- orelse
-        C =:= $  %% space
+        lists:member(C, ".,;!?:/'- ")
     end, Str).
 
-%%------------------------------------------------------------------
-%% Embryo Construction
-%%------------------------------------------------------------------
-
-build_embryos(_Word, [], _Index, Acc) ->
+build_embryos(_Word, [], _Idx, Acc) ->
     lists:reverse(Acc);
-
-build_embryos(Word, [Def|Rest], Index, Acc) ->
-    Url = lists:flatten(io_lib:format("https://www.cnrtl.fr/definition/~s#def~p", [Word, Index])),
+build_embryos(Word, [Def | Rest], Idx, Acc) ->
+    Url = lists:flatten(
+        io_lib:format("https://www.cnrtl.fr/definition/~s#def~p", [Word, Idx])),
     Embryo = #{
-        properties => #{
-            <<"resume">> => list_to_binary(Def),
+        <<"properties">> => #{
             <<"url">>    => list_to_binary(Url),
+            <<"resume">> => list_to_binary(Def),
             <<"word">>   => list_to_binary(Word),
             <<"source">> => <<"www.cnrtl.fr">>
         }
     },
-    build_embryos(Word, Rest, Index + 1, [Embryo|Acc]).
-
+    build_embryos(Word, Rest, Idx + 1, [Embryo | Acc]).
