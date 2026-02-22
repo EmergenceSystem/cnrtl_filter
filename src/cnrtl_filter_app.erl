@@ -103,7 +103,7 @@ try_patterns(Html, [Pat | Rest]) ->
 
 clean_definition_block(Block) ->
     NoTags   = re:replace(Block, "<[^>]+>", " ", [global, {return, list}]),
-    Decoded  = embryo:decode_html_entities(NoTags),
+    Decoded  = decode_html_entities(NoTags),
     Clean    = re:replace(Decoded, "\\s+", " ", [global, {return, list}]),
     string:trim(Clean).
 
@@ -148,3 +148,17 @@ build_embryos(Word, [Def | Rest], Idx, Acc) ->
         }
     },
     build_embryos(Word, Rest, Idx + 1, [Embryo | Acc]).
+
+%% Decodes common HTML entities to their character equivalents.
+decode_html_entities(Text) ->
+    Entities = [
+        {"&amp;",    "&"},  {"&lt;",  "<"},  {"&gt;",   ">"},
+        {"&quot;",   "\""}, {"&#39;", "'"},
+        {"&agrave;", "à"},  {"&aacute;", "á"},
+        {"&eacute;", "é"},  {"&egrave;", "è"}, {"&ecirc;", "ê"},
+        {"&icirc;",  "î"},  {"&ocirc;",  "ô"}, {"&ugrave;", "ù"},
+        {"&ccedil;", "ç"},  {"&nbsp;",   " "}
+    ],
+    lists:foldl(fun({Entity, Char}, Acc) ->
+        re:replace(Acc, Entity, Char, [global, {return, list}])
+    end, Text, Entities).
