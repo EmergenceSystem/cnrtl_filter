@@ -1,15 +1,21 @@
 %%%-------------------------------------------------------------------
-%%% @doc CNRTL French dictionary filter.
+%%% @doc CNRTL French dictionary agent.
 %%%
-%%% Fetches definitions from the CNRTL website for a given word
-%%% and returns them as a list of embryo maps.
+%%% As an agent this module:
+%%%   - Announces capabilities to em_disco on startup via `agent_hello'.
+%%%   - Maintains a memory of definition URLs already returned, so
+%%%     duplicate definitions across successive queries are filtered out.
+%%%
+%%% Handler contract: `handle/2' (Body, Memory) -> {RawList, NewMemory}.
+%%% Returns a raw Erlang list — em_filter_server encodes it.
+%%% Memory schema: `#{seen => #{binary_url => true}}'.
 %%% @end
 %%%-------------------------------------------------------------------
 -module(cnrtl_filter_app).
 -behaviour(application).
 
 -export([start/2, stop/1]).
--export([handle/1]).
+-export([handle/1, handle/2]).
 
 -define(BASE_URL,       "https://www.cnrtl.fr/definition/").
 -define(MIN_DEF_LENGTH, 10).
@@ -17,18 +23,45 @@
 -define(MIN_WORD_COUNT, 3).
 -define(MAX_WORD_COUNT, 50).
 
+-define(CAPABILITIES, [
+    <<"cnrtl">>,
+    <<"french">>,
+    <<"dictionary">>,
+    <<"definition">>,
+    <<"lexicon">>
+]).
+
 %%====================================================================
 %% Application behaviour
 %%====================================================================
 
 start(_Type, _Args) ->
-    em_filter:start_filter(cnrtl_filter, ?MODULE).
+    em_filter:start_agent(cnrtl_filter, ?MODULE, #{
+        capabilities => ?CAPABILITIES,
+        memory       => ets
+    }).
 
 stop(_State) ->
     em_filter:stop_filter(cnrtl_filter).
 
 %%====================================================================
-%% Filter handler — returns a list of embryo maps
+%% Agent handler — with memory (primary path)
+%%====================================================================
+
+handle(Body, Memory) when is_binary(Body) ->
+    Seen    = maps:get(seen, Memory, #{}),
+    Embryos = generate_embryo_list(Body),
+    Fresh   = [E || E <- Embryos, not maps:is_key(url_of(E), Seen)],
+    NewSeen = lists:foldl(fun(E, Acc) ->
+        Acc#{url_of(E) => true}
+    end, Seen, Fresh),
+    {Fresh, Memory#{seen => NewSeen}};
+
+handle(_Body, Memory) ->
+    {[], Memory}.
+
+%%====================================================================
+%% Plain filter handler — backward compatibility
 %%====================================================================
 
 handle(Body) when is_binary(Body) ->
@@ -37,7 +70,7 @@ handle(_) ->
     [].
 
 %%====================================================================
-%% Search and processing
+%% Search and processing (unchanged)
 %%====================================================================
 
 generate_embryo_list(JsonBinary) ->
@@ -70,16 +103,12 @@ extract_params(JsonBinary) ->
         _:_ -> {binary_to_list(JsonBinary), 10}
     end.
 
-%%--------------------------------------------------------------------
-%% Definition extraction
-%%--------------------------------------------------------------------
-
 extract_all_definitions(HtmlBin, Word) ->
-    Html     = binary_to_list(HtmlBin),
-    Blocks   = extract_definition_blocks(Html),
-    Cleaned  = [clean_definition_block(B) || B <- Blocks, B =/= ""],
-    Valid    = [D || D <- Cleaned, is_valid_definition(D)],
-    Final    = filter_edge_cases(Valid),
+    Html    = binary_to_list(HtmlBin),
+    Blocks  = extract_definition_blocks(Html),
+    Cleaned = [clean_definition_block(B) || B <- Blocks, B =/= ""],
+    Valid   = [D || D <- Cleaned, is_valid_definition(D)],
+    Final   = filter_edge_cases(Valid),
     build_embryos(Word, Final, 1, []).
 
 extract_definition_blocks(Html) ->
@@ -102,19 +131,19 @@ try_patterns(Html, [Pat | Rest]) ->
     end.
 
 clean_definition_block(Block) ->
-    NoTags   = re:replace(Block, "<[^>]+>", " ", [global, {return, list}]),
-    Decoded  = decode_html_entities(NoTags),
-    Clean    = re:replace(Decoded, "\\s+", " ", [global, {return, list}]),
+    NoTags  = re:replace(Block, "<[^>]+>", " ", [global, {return, list}]),
+    Decoded = decode_html_entities(NoTags),
+    Clean   = re:replace(Decoded, "\\s+", " ", [global, {return, list}]),
     string:trim(Clean).
 
 is_valid_definition(Def) ->
-    Len      = length(Def),
-    Words    = string:tokens(Def, " "),
-    WCount   = length(Words),
-    LenOk    = Len >= ?MIN_DEF_LENGTH andalso Len =< ?MAX_DEF_LENGTH,
-    UpperOk  = case Def of
-        []        -> false;
-        [H | _]   -> H =:= string:to_upper(H)
+    Len     = length(Def),
+    Words   = string:tokens(Def, " "),
+    WCount  = length(Words),
+    LenOk   = Len >= ?MIN_DEF_LENGTH andalso Len =< ?MAX_DEF_LENGTH,
+    UpperOk = case Def of
+        []      -> false;
+        [H | _] -> H =:= string:to_upper(H)
     end,
     PunctOk  = lists:member(string:right(Def, 1), [".", ";", "!", "?"]),
     WCountOk = WCount >= ?MIN_WORD_COUNT andalso WCount =< ?MAX_WORD_COUNT,
@@ -149,7 +178,6 @@ build_embryos(Word, [Def | Rest], Idx, Acc) ->
     },
     build_embryos(Word, Rest, Idx + 1, [Embryo | Acc]).
 
-%% Decodes common HTML entities to their character equivalents.
 decode_html_entities(Text) ->
     Entities = [
         {"&amp;",    "&"},  {"&lt;",  "<"},  {"&gt;",   ">"},
@@ -162,3 +190,11 @@ decode_html_entities(Text) ->
     lists:foldl(fun({Entity, Char}, Acc) ->
         re:replace(Acc, Entity, Char, [global, {return, list}])
     end, Text, Entities).
+
+%%====================================================================
+%% Internal helpers
+%%====================================================================
+
+-spec url_of(map()) -> binary().
+url_of(#{<<"properties">> := #{<<"url">> := Url}}) -> Url;
+url_of(_) -> <<>>.
