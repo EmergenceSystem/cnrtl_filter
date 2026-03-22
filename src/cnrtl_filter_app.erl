@@ -1,19 +1,20 @@
 %%%-------------------------------------------------------------------
 %%% @doc CNRTL French dictionary agent.
 %%%
-%%% Announces capabilities to em_disco on startup and maintains a
-%%% memory of definition URLs already returned so duplicates across
-%%% successive queries are filtered out.
+%%% Deduplication by URL is handled upstream by the Emquest pipeline.
 %%%
-%%% Handler contract: `handle/2' (Body, Memory) -> {RawList, NewMemory}.
-%%% Memory schema: `#{seen => #{binary_url => true}}'.
+%%% === Capability cascade ===
+%%%
+%%%   base_capabilities/0 extends em_filter:base_capabilities().
+%%%
+%%% Handler contract: handle/2 (Body, Memory) -> {RawList, Memory}.
 %%% @end
 %%%-------------------------------------------------------------------
 -module(cnrtl_filter_app).
 -behaviour(application).
 
 -export([start/2, stop/1]).
--export([handle/2]).
+-export([handle/2, base_capabilities/0]).
 
 -define(BASE_URL,       "https://www.cnrtl.fr/definition/").
 -define(MIN_DEF_LENGTH, 10).
@@ -21,13 +22,15 @@
 -define(MIN_WORD_COUNT, 3).
 -define(MAX_WORD_COUNT, 50).
 
--define(CAPABILITIES, [
-    <<"cnrtl">>,
-    <<"french">>,
-    <<"dictionary">>,
-    <<"definition">>,
-    <<"lexicon">>
-]).
+%%====================================================================
+%% Capability cascade
+%%====================================================================
+
+-spec base_capabilities() -> [binary()].
+base_capabilities() ->
+    em_filter:base_capabilities() ++ [<<"cnrtl">>, <<"french">>,
+                                      <<"dictionary">>, <<"definition">>,
+                                      <<"lexicon">>].
 
 %%====================================================================
 %% Application behaviour
@@ -35,9 +38,9 @@
 
 start(_Type, _Args) ->
     em_filter:start_agent(cnrtl_filter, ?MODULE, #{
-        capabilities => ?CAPABILITIES,
-        memory       => ets
-    }).
+        capabilities => base_capabilities()
+    }),
+    {ok, self()}.
 
 stop(_State) ->
     em_filter:stop_agent(cnrtl_filter).
@@ -47,14 +50,7 @@ stop(_State) ->
 %%====================================================================
 
 handle(Body, Memory) when is_binary(Body) ->
-    Seen    = maps:get(seen, Memory, #{}),
-    Embryos = generate_embryo_list(Body),
-    Fresh   = [E || E <- Embryos, not maps:is_key(url_of(E), Seen)],
-    NewSeen = lists:foldl(fun(E, Acc) ->
-        Acc#{url_of(E) => true}
-    end, Seen, Fresh),
-    {Fresh, Memory#{seen => NewSeen}};
-
+    {generate_embryo_list(Body), Memory};
 handle(_Body, Memory) ->
     {[], Memory}.
 
@@ -79,7 +75,8 @@ generate_embryo_list(JsonBinary) ->
 extract_params(JsonBinary) ->
     try json:decode(JsonBinary) of
         Map when is_map(Map) ->
-            Value   = binary_to_list(maps:get(<<"value">>,   Map, <<"">>)),
+            Value   = binary_to_list(maps:get(<<"value">>, Map,
+                          maps:get(<<"query">>, Map, <<"">>))),
             Timeout = case maps:get(<<"timeout">>, Map, undefined) of
                 undefined            -> 10;
                 T when is_integer(T) -> T;
@@ -179,7 +176,3 @@ decode_html_entities(Text) ->
     lists:foldl(fun({Entity, Char}, Acc) ->
         re:replace(Acc, Entity, Char, [global, {return, list}])
     end, Text, Entities).
-
--spec url_of(map()) -> binary().
-url_of(#{<<"properties">> := #{<<"url">> := Url}}) -> Url;
-url_of(_) -> <<>>.
